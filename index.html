@@ -51,10 +51,13 @@
             height: 100%;
             width: 100%;
             overflow: hidden;
-            position: fixed;
+            /* absolute instead of fixed — fixed positioning inside
+               iframes/webviews causes layout bugs on iOS Safari and
+               Android WebView (like nailing a picture to a moving wall) */
+            position: absolute;
             top: 0;
             left: 0;
-            touch-action: pan-y;
+            touch-action: none; /* we handle all gestures manually */
         }
 
         /* ============================================
@@ -236,7 +239,7 @@
             overflow-y: auto;
             overflow-x: hidden;
             -webkit-overflow-scrolling: touch;
-            padding: calc(24px + var(--safe-top)) 36px calc(70px + var(--safe-bottom)) 20px;
+            padding: calc(24px + var(--safe-top)) 40px calc(70px + var(--safe-bottom)) 20px;
         }
 
         .slide.active {
@@ -1276,76 +1279,104 @@
 
     <script>
         /* ============================================
-           GROUP MEMBERSHIP MANAGER
-           (unchanged business logic)
+           SHARED CONSTANTS
+           Both the iframe logic and the parent-listener
+           use these — single source of truth.
+           ============================================ */
+        const MESSAGE_TYPE = 'staffbase-industry-switch';
+        const INDUSTRY_GROUP_IDS = new Set([
+            '69672894afdf7d24c5feaafd',
+            '69672db75cff0a6a031724d7',
+            '69672f84a2c10951567a0552',
+            '69535e6338dc171a511fecbe',
+            '69672fbaafdf7d24c5feef0c',
+            '69673076a2c10951567a0db5'
+        ]);
+        const DISCOVER_ENDPOINT = '/auth/discover';
+        const USER_ENDPOINT = '/api/users/me';
+        const DISCOVER_ACCEPT = 'application/vnd.staffbase.auth.discovery.v2+json';
+        const USER_ACCEPT = 'application/vnd.staffbase.accessors.user.v2+json';
+        const ALLOWED_MESSAGE_ORIGINS = new Set([
+            window.location.origin,
+            'https://cdcruz-sbse.github.io'
+        ]);
+
+        /* ============================================
+           GROUP MEMBERSHIP — shared API layer
+           Used by both the iframe nav handler AND
+           the parent message listener.
            ============================================ */
         class GroupMembershipManager {
             constructor() {
-                this.industryGroupIds = new Set([
-                    '69672894afdf7d24c5feaafd',
-                    '69672db75cff0a6a031724d7',
-                    '69672f84a2c10951567a0552',
-                    '69535e6338dc171a511fecbe',
-                    '69672fbaafdf7d24c5feef0c',
-                    '69673076a2c10951567a0db5'
-                ]);
-                this.discoverEndpoint = '/auth/discover';
-                this.userEndpoint = '/api/users/me';
                 this.cachedUser = null;
                 this.cachedCsrfToken = '';
                 this.discoverPromise = null;
             }
 
             async switchToGroup(targetGroupId) {
-                if (!targetGroupId || !this.industryGroupIds.has(targetGroupId)) return;
-                const user = await this.fetchCurrentUser();
+                if (!targetGroupId || !INDUSTRY_GROUP_IDS.has(targetGroupId)) return;
+                const { user, csrfToken } = await this.getUserAndToken();
                 if (!user || !user.id) return;
 
-                const currentGroupIds = new Set(user.groupIDs || []);
-                const groupsToRemove = [...currentGroupIds].filter(
-                    gid => this.industryGroupIds.has(gid) && gid !== targetGroupId
+                const currentIds = Array.isArray(user.groupIDs) ? user.groupIDs : [];
+                const toRemove = currentIds.filter(
+                    gid => INDUSTRY_GROUP_IDS.has(gid) && gid !== targetGroupId
                 );
-                const needsAdd = !currentGroupIds.has(targetGroupId);
-                if (!groupsToRemove.length && !needsAdd) return;
+                const needsAdd = !currentIds.includes(targetGroupId);
 
-                if (groupsToRemove.length) {
+                console.log('[Switcher] Group state:', { toRemove, needsAdd });
+                if (!toRemove.length && !needsAdd) return;
+
+                if (toRemove.length) {
                     await Promise.allSettled(
-                        groupsToRemove.map(gid => this.updateGroupMembership(gid, 'remove', user.id))
+                        toRemove.map(gid => this.updateMembership(gid, 'remove', user.id, csrfToken))
                     );
                 }
                 if (needsAdd) {
-                    await this.updateGroupMembership(targetGroupId, 'add', user.id);
+                    await this.updateMembership(targetGroupId, 'add', user.id, csrfToken);
                 }
             }
 
-            async fetchCurrentUser() {
-                if (this.cachedUser) return this.cachedUser;
+            async getUserAndToken() {
+                // Try discovery first (gives us user + csrf in one call)
                 try {
-                    const discovery = await this.fetchDiscoverInfo();
-                    if (discovery && discovery.user) return discovery.user;
-                } catch (e) { /* fall through */ }
+                    const discovery = await this.fetchDiscover();
+                    if (discovery?.user) {
+                        return { user: discovery.user, csrfToken: discovery.csrfToken || '' };
+                    }
+                } catch (e) {
+                    console.warn('[Switcher] Discovery unavailable, using fallback.');
+                }
 
-                const res = await fetch(this.userEndpoint, {
-                    method: 'GET', credentials: 'include',
-                    headers: { 'accept': 'application/vnd.staffbase.accessors.user.v2+json' }
+                // Fallback to /api/users/me
+                const res = await fetch(USER_ENDPOINT, {
+                    method: 'GET',
+                    credentials: 'include',
+                    cache: 'no-store',
+                    headers: { 'accept': USER_ACCEPT }
                 });
                 if (!res.ok) throw new Error('Failed to load user information.');
                 const user = await res.json();
                 this.cachedUser = user;
-                return user;
+                return { user, csrfToken: this.getCsrfToken() };
             }
 
-            async fetchDiscoverInfo() {
+            async fetchDiscover() {
                 if (this.discoverPromise) return this.discoverPromise;
-                this.discoverPromise = fetch(this.discoverEndpoint, {
-                    method: 'GET', credentials: 'include',
-                    headers: { 'accept': 'application/vnd.staffbase.auth.discovery.v2+json' }
-                }).then(r => { if (!r.ok) throw new Error(); return r.json(); })
-                  .then(data => {
-                      if (data?.user) this.cachedUser = data.user;
-                      if (data?.csrfToken) this.cachedCsrfToken = data.csrfToken;
-                      return data;
-                  }).finally(() => { this.discoverPromise = null; });
+                this.discoverPromise = fetch(DISCOVER_ENDPOINT, {
+                    method: 'GET',
+                    credentials: 'include',
+                    cache: 'no-store',
+                    headers: { 'accept': DISCOVER_ACCEPT }
+                })
+                .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+                .then(data => {
+                    if (data?.user) this.cachedUser = data.user;
+                    if (data?.csrfToken) this.cachedCsrfToken = data.csrfToken;
+                    console.log('[Switcher] Discovery loaded.');
+                    return data;
+                })
+                .finally(() => { this.discoverPromise = null; });
                 return this.discoverPromise;
             }
 
@@ -1356,47 +1387,150 @@
             }
 
             getCsrfToken() {
+                // 1. Meta tag
                 const meta = document.querySelector('meta[name="csrf-token"], meta[name="x-csrf-token"]');
                 if (meta?.content) return meta.content;
+
+                // 2. Common cookie names
                 for (const name of ['csrf', 'csrf_token', 'csrfToken', 'XSRF-TOKEN', 'CSRF-TOKEN']) {
                     const v = this.getCookieValue(name);
                     if (v) return v;
                 }
+
+                // 3. CSRF_ prefix pattern
                 const match = document.cookie.match(/CSRF_[A-Za-z0-9]+/);
                 if (match) return match[0];
+
+                // 4. Staffbase global objects
                 if (window.staffbase?.csrfToken) return window.staffbase.csrfToken;
                 if (window.__STAFFBASE__?.csrfToken) return window.__STAFFBASE__.csrfToken;
                 if (window.__INITIAL_STATE__?.csrfToken) return window.__INITIAL_STATE__.csrfToken;
+
+                // 5. Cached from discovery
                 return this.cachedCsrfToken || '';
             }
 
-            async updateGroupMembership(groupId, action, userId) {
+            async updateMembership(groupId, action, userId, csrfToken) {
                 const isAdd = action === 'add';
                 const mediaType = isAdd
                     ? 'application/vnd.staffbase.accessors.group.members-add.v1+json'
                     : 'application/vnd.staffbase.accessors.group.members-remove.v1+json';
                 const headers = { 'accept': mediaType, 'content-type': mediaType };
-                let csrf = this.getCsrfToken();
-                if (!csrf) { try { await this.fetchDiscoverInfo(); } catch(e) {} csrf = this.getCsrfToken(); }
-                if (csrf) headers['x-csrf-token'] = csrf;
 
+                // If no token was passed in, try to get one fresh
+                if (!csrfToken) {
+                    try { await this.fetchDiscover(); } catch(e) {}
+                    csrfToken = this.getCsrfToken();
+                }
+                if (csrfToken) headers['x-csrf-token'] = csrfToken;
+
+                console.log('[Switcher] Updating group:', { groupId, action });
                 const res = await fetch(`/api/groups/${groupId}/members`, {
-                    method: 'PATCH', credentials: 'include', headers,
+                    method: 'PATCH',
+                    credentials: 'include',
+                    headers,
                     body: JSON.stringify({ userIds: [userId] })
                 });
-                if (!res.ok) throw new Error(`Failed to ${action} group membership.`);
+                if (!res.ok) {
+                    console.warn('[Switcher] Group update failed:', { groupId, action, status: res.status });
+                    throw new Error(`Failed to ${action} group membership.`);
+                }
+                console.log('[Switcher] Group update success:', { groupId, action });
             }
         }
 
         /* ============================================
-           NAVIGATION HANDLER
+           PARENT MESSAGE LISTENER
+           Merged from the standalone global script.
+           Listens for postMessage from this iframe
+           (or from a child iframe if this page is
+           itself the parent). Acts as a self-contained
+           fallback so group switching works even if
+           the Staffbase custom JS injection isn't
+           present.
+           ============================================ */
+        class ParentMessageListener {
+            constructor(groupManager) {
+                this.groupManager = groupManager;
+                this.isProcessing = false;
+                this.init();
+            }
+
+            init() {
+                window.addEventListener('message', (event) => this.handleMessage(event));
+                console.log('[Switcher] Parent message listener active.');
+            }
+
+            isAllowedOrigin(origin) {
+                if (origin === 'null') return true;  // sandboxed iframes
+                if (ALLOWED_MESSAGE_ORIGINS.has(origin)) return true;
+                console.warn('[Switcher] Blocked message from origin:', origin);
+                return false;
+            }
+
+            normalizeDestination(destination) {
+                if (!destination) return '';
+                try {
+                    const url = new URL(destination, window.location.origin);
+                    if (url.origin !== window.location.origin) return '';
+                    if (!url.pathname.startsWith('/content/page/')) return '';
+                    return url.pathname + url.search + url.hash;
+                } catch (e) {
+                    // Could be a relative app path like /content/page/xxx
+                    if (typeof destination === 'string' && destination.startsWith('/content/page/')) {
+                        return destination;
+                    }
+                    return '';
+                }
+            }
+
+            handleMessage(event) {
+                if (!event?.data || event.data.type !== MESSAGE_TYPE) return;
+                console.log('[Switcher] Message received:', { origin: event.origin, data: event.data });
+
+                if (!this.isAllowedOrigin(event.origin)) return;
+
+                const targetGroupId = String(event.data.groupId || '');
+                if (!INDUSTRY_GROUP_IDS.has(targetGroupId)) {
+                    console.warn('[Switcher] Unknown groupId:', targetGroupId);
+                    return;
+                }
+
+                const destination = this.normalizeDestination(event.data.destination);
+                if (!destination) {
+                    console.warn('[Switcher] Destination rejected:', event.data.destination);
+                    return;
+                }
+
+                if (this.isProcessing) {
+                    console.warn('[Switcher] Already processing a request.');
+                    return;
+                }
+
+                this.isProcessing = true;
+                console.log('[Switcher] Processing:', { groupId: targetGroupId, destination });
+
+                this.groupManager.switchToGroup(targetGroupId)
+                    .catch(err => console.error('[Switcher] Switch failed:', err))
+                    .finally(() => {
+                        console.log('[Switcher] Navigating to:', destination);
+                        window.location.href = destination;
+                        // Reset after a delay in case navigation is blocked
+                        setTimeout(() => { this.isProcessing = false; }, 5000);
+                    });
+            }
+        }
+
+        /* ============================================
+           NAVIGATION HANDLER — iframe-side nav clicks
+           Posts messages to parent when embedded,
+           falls back to direct API calls + redirect.
            ============================================ */
         class NavigationHandler {
             constructor(groupManager) {
                 this.groupManager = groupManager;
                 this.isMobile = this.detectMobile();
                 this.isNavigating = false;
-                this.messageType = 'staffbase-industry-switch';
                 this.lastTouchTime = 0;
                 this.init();
             }
@@ -1409,22 +1543,28 @@
             }
 
             init() {
+                console.log('[Switcher] Nav handler ready. Mobile:', this.isMobile);
                 this.setupNavigation();
             }
 
-            detectEmbedded() {
+            isEmbedded() {
                 try { return window.top !== window.self; } catch (e) { return true; }
             }
 
             setupNavigation() {
                 document.querySelectorAll('.nav-link').forEach(link => {
                     const handler = (e) => this.handleNavigation(e, link);
+
+                    // Touch-first: touchend fires before click on mobile.
+                    // We track timing to prevent double-firing.
                     link.addEventListener('touchend', (e) => {
                         this.lastTouchTime = Date.now();
                         handler(e);
-                    });
+                    }, { passive: false });
+
                     link.addEventListener('click', (e) => {
-                        if (Date.now() - this.lastTouchTime < 600) return;
+                        // Skip if this was already handled by touchend
+                        if (Date.now() - this.lastTouchTime < 800) return;
                         handler(e);
                     });
                 });
@@ -1436,6 +1576,7 @@
             }
 
             getMessageTarget() {
+                // Prefer top (Staffbase shell), fall back to parent
                 let t = null;
                 try { if (window.top && window.top !== window) t = window.top; } catch(e) {}
                 if (!t) { try { if (window.parent && window.parent !== window) t = window.parent; } catch(e) {} }
@@ -1445,16 +1586,22 @@
             postSwitchMessage(groupId, destination) {
                 const target = this.getMessageTarget();
                 if (!target) return false;
-                target.postMessage({ type: this.messageType, groupId, destination }, '*');
+                target.postMessage({ type: MESSAGE_TYPE, groupId, destination }, '*');
+                console.log('[Switcher] Posted switch message:', { groupId, destination });
                 return true;
             }
 
             async handleNavigation(e, link) {
                 if (this.isNavigating || this.shouldIgnoreEvent(e)) return;
+
                 const appPath = link.getAttribute('data-app-path');
                 const href = link.getAttribute('href');
-                const destination = this.isMobile && appPath ? appPath : href;
                 const targetGroupId = link.getAttribute('data-group-id');
+
+                // On mobile webview: prefer app-relative path
+                // On desktop/browser: use full href
+                const destination = this.isMobile && appPath ? appPath : href;
+
                 if (!destination || !targetGroupId) return;
                 if (!appPath?.startsWith('/content/page/') && !href?.includes('/content/page/')) return;
 
@@ -1462,19 +1609,36 @@
                 e.stopPropagation();
                 this.isNavigating = true;
 
-                if (this.detectEmbedded() && targetGroupId) {
+                console.log('[Switcher] Link activated:', {
+                    groupId: targetGroupId,
+                    destination,
+                    embedded: this.isEmbedded(),
+                    mobile: this.isMobile
+                });
+
+                // Strategy 1: If embedded, post message to parent shell
+                // The parent listener (either injected Staffbase JS or our
+                // own ParentMessageListener) handles the switch + redirect.
+                if (this.isEmbedded() && targetGroupId) {
                     if (this.postSwitchMessage(targetGroupId, destination)) {
-                        setTimeout(() => { this.isNavigating = false; }, 4000);
+                        // Give the parent time to process before unlocking
+                        setTimeout(() => { this.isNavigating = false; }, 5000);
                         return;
                     }
                 }
 
+                // Strategy 2: Direct API call + redirect (non-embedded fallback)
                 if (this.groupManager && targetGroupId) {
-                    try { await this.groupManager.switchToGroup(targetGroupId); } catch(e) {}
+                    try {
+                        await this.groupManager.switchToGroup(targetGroupId);
+                    } catch (err) {
+                        console.error('[Switcher] Direct group switch failed:', err);
+                    }
                 }
 
+                // Mobile webviews sometimes need a tick to flush pending requests
                 if (this.isMobile) {
-                    setTimeout(() => { window.location.href = destination; }, 100);
+                    setTimeout(() => { window.location.href = destination; }, 150);
                 } else {
                     window.location.href = destination;
                 }
@@ -1482,7 +1646,7 @@
         }
 
         /* ============================================
-           SCROLL SLIDER
+           SCROLL SLIDER — swipe + wheel + keyboard
            ============================================ */
         class ScrollSlider {
             constructor() {
@@ -1499,12 +1663,19 @@
             }
 
             init() {
+                // Wheel (desktop)
                 window.addEventListener('wheel', e => this.handleScroll(e), { passive: false });
+
+                // Touch (mobile) — using document-level listeners for
+                // reliable capture inside webview iframes
                 document.addEventListener('touchstart', e => this.handleTouchStart(e), { passive: true });
                 document.addEventListener('touchmove', e => this.handleTouchMove(e), { passive: false });
                 document.addEventListener('touchend', e => this.handleTouchEnd(e), { passive: true });
+
+                // Keyboard
                 window.addEventListener('keydown', e => this.handleKeydown(e));
 
+                // Progress dot navigation (click + touch)
                 document.querySelectorAll('.progress-item').forEach(item => {
                     const go = (e) => {
                         e.preventDefault();
@@ -1515,14 +1686,17 @@
                     item.addEventListener('touchend', go);
                 });
 
+                // Custom cursor — desktop only
                 if (window.matchMedia('(hover: hover) and (pointer: fine)').matches) {
                     this.initCursor();
                 }
             }
 
+            /* --- Wheel (desktop) --- */
             handleScroll(e) {
                 e.preventDefault();
                 if (Date.now() - this.lastScrollTime < 90 || this.isAnimating) return;
+
                 this.wheelDelta += e.deltaY;
                 if (this.wheelTimer) clearTimeout(this.wheelTimer);
                 this.wheelTimer = setTimeout(() => { this.wheelDelta = 0; }, 140);
@@ -1534,39 +1708,48 @@
                 }
             }
 
+            /* --- Touch (mobile) --- */
             handleTouchStart(e) {
-                if (e.target.closest('.nav-link')) return;
+                // Don't hijack touches on nav links or portfolio cards
+                if (e.target.closest('.nav-link, .portfolio-card')) return;
                 this.touchStartY = e.touches[0].clientY;
                 this.touchStartX = e.touches[0].clientX;
                 this.touchStartTime = Date.now();
             }
 
             handleTouchMove(e) {
-                if (e.target.closest('.nav-link') || this.isAnimating) return;
+                if (e.target.closest('.nav-link, .portfolio-card') || this.isAnimating) return;
                 const dy = this.touchStartY - e.touches[0].clientY;
                 const dx = this.touchStartX - e.touches[0].clientX;
+                // Only prevent default for clearly vertical swipes
                 if (Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > 10) {
                     e.preventDefault();
                 }
             }
 
             handleTouchEnd(e) {
-                if (e.target.closest('.nav-link') || this.isAnimating) return;
+                if (e.target.closest('.nav-link, .portfolio-card') || this.isAnimating) return;
                 const dy = this.touchStartY - e.changedTouches[0].clientY;
                 const dx = this.touchStartX - e.changedTouches[0].clientX;
                 const dt = Date.now() - this.touchStartTime;
 
+                // Swipe thresholds tuned for mobile webview:
+                // - 24px minimum travel (forgiving for small screens)
+                // - 700ms max duration (allows deliberate swipes)
+                // - Must be more vertical than horizontal
                 if (Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > 24 && dt < 700) {
                     dy > 0 ? this.nextSlide() : this.prevSlide();
                 }
             }
 
+            /* --- Keyboard --- */
             handleKeydown(e) {
                 if (this.isAnimating) return;
                 if (['ArrowDown', 'PageDown', ' '].includes(e.key)) { e.preventDefault(); this.nextSlide(); }
                 else if (['ArrowUp', 'PageUp'].includes(e.key)) { e.preventDefault(); this.prevSlide(); }
             }
 
+            /* --- Slide transitions --- */
             nextSlide() { if (this.currentSlide < this.totalSlides - 1) this.goToSlide(this.currentSlide + 1); }
             prevSlide() { if (this.currentSlide > 0) this.goToSlide(this.currentSlide - 1); }
 
@@ -1576,12 +1759,16 @@
 
                 const slides = document.querySelectorAll('.slide');
                 const progress = document.querySelectorAll('.progress-item');
+
                 slides[this.currentSlide].classList.remove('active');
                 slides[index].classList.add('active');
                 slides[index].scrollTop = 0;
+
                 progress[this.currentSlide].classList.remove('active');
                 progress[index].classList.add('active');
-                document.querySelector('.counter-current').textContent = String(index + 1).padStart(2, '0');
+
+                document.querySelector('.counter-current').textContent =
+                    String(index + 1).padStart(2, '0');
 
                 const hint = document.querySelector('.scroll-hint');
                 if (hint) hint.style.opacity = index === this.totalSlides - 1 ? '0' : '0.5';
@@ -1590,10 +1777,12 @@
                 setTimeout(() => { this.isAnimating = false; }, 650);
             }
 
+            /* --- Custom cursor (desktop only) --- */
             initCursor() {
                 const cursor = document.querySelector('.cursor');
                 const dot = document.querySelector('.cursor-dot');
                 if (!cursor || !dot) return;
+
                 let mx = 0, my = 0, cx = 0, cy = 0;
 
                 document.addEventListener('mousemove', e => {
@@ -1625,13 +1814,24 @@
         }
 
         /* ============================================
-           INIT
+           BOOT — initialize everything
            ============================================ */
         const boot = () => {
+            console.log('[Switcher] Booting portal...');
             const gm = new GroupMembershipManager();
+
+            // 1. Parent message listener (handles incoming postMessage)
+            new ParentMessageListener(gm);
+
+            // 2. Navigation handler (handles outgoing link clicks)
             new NavigationHandler(gm);
+
+            // 3. Slide controller (swipe, wheel, keyboard)
             new ScrollSlider();
+
+            console.log('[Switcher] Portal ready.');
         };
+
         document.readyState === 'loading'
             ? document.addEventListener('DOMContentLoaded', boot)
             : boot();
